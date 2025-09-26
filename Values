@@ -1,0 +1,39 @@
+Small Map 
+
+Stratergies   Energy    Time 
+1. bfc         1485      15
+2. ucs         1485      15
+3. astar       1485      15
+4. hillclimb   1485      15
+5. simanneal   1500       0
+
+
+Medium Map 
+
+Stratergies   Energy   Time 
+1. bfc         1428     48
+2. ucs         1445     52
+3. astar       1445     52
+4. hillclimb   1422     54
+5. simanneal   1498      2
+
+
+
+Large Map 
+
+Stratergies   Energy   Time 
+1. bfc         1497      3
+2. ucs         1497      3
+3. astar       1497      3
+4. hillclimb   1497      3
+5. simanneal   1455     45
+
+
+Dynamic Map 
+
+Stratergies   Energy   Time 
+1. bfc         1482     18
+2. ucs         1482     18
+3. astar       1482     18 
+4. hillclimb   1482     18 
+5. simanneal   1452     48
