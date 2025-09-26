@@ -1,0 +1,669 @@
+import heapq
+import random
+import math
+from collections import deque
+import time
+import argparse
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+from typing import Tuple, List, Dict, Any, Optional
+
+# A fundamental unit of our grid-based world
+class GridCell:
+    """Represents a single tile on the grid with associated attributes."""
+    def __init__(self, traversability_cost: int = 1, is_impassable: bool = False):
+        self.traversability_cost = traversability_cost
+        self.is_impassable = is_impassable
+
+    def get_movement_difficulty(self, current_time_step: int) -> float:
+        """
+        Calculates the cost to traverse this cell at a specific moment.
+        This feature allows for modeling of transient barriers.
+        """
+        if self.is_impassable:
+            return float('inf')
+        return self.traversability_cost
+
+# The complete environment for our automated courier
+class DeliveryWorld:
+    """Manages the grid environment's layout and configuration."""
+    def __init__(self):
+        self.grid_width: int = 0
+        self.grid_height: int = 0
+        self.grid_of_cells: List[List[GridCell]] = []
+        self.delivery_tasks: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        self.courier_starting_point: Tuple[int, int] = (0, 0)
+        self.energy_capacity: int = 1000
+        self.time_allowance: int = 1000
+
+    def configure_environment(self, level_file: str):
+        """Loads a predefined grid layout from a file name."""
+        if level_file == "small.map":
+            self.grid_width, self.grid_height = 5, 5
+            self.grid_of_cells = [[GridCell() for _ in range(self.grid_width)] for _ in range(self.grid_height)]
+            # Placing some roadblocks
+            self.grid_of_cells[2][2].is_impassable = True
+            self.grid_of_cells[3][1].is_impassable = True
+            self.delivery_tasks = [((1, 1), (4, 4))]
+            self.courier_starting_point = (0, 0)
+        elif level_file == "medium.map":
+            self.grid_width, self.grid_height = 10, 10
+            self.grid_of_cells = [[GridCell() for _ in range(self.grid_width)] for _ in range(self.grid_height)]
+            # Creating some difficult terrain
+            for i in range(3, 7):
+                for j in range(3, 7):
+                    self.grid_of_cells[i][j].traversability_cost = 3
+            self.grid_of_cells[5][5].is_impassable = True
+            self.grid_of_cells[6][2].is_impassable = True
+            self.grid_of_cells[7][7].is_impassable = True
+            self.delivery_tasks = [((0, 1), (9, 9)), ((2, 2), (8, 8))]
+            self.courier_starting_point = (0, 0)
+        elif level_file == "large.map":
+            self.grid_width, self.grid_height = 10, 10
+            self.grid_of_cells = [[GridCell() for _ in range(self.grid_width)] for _ in range(self.grid_height)]
+            # Populating with a few dispersed obstacles
+            for i in range(self.grid_height):
+                for j in range(self.grid_width):
+                    if (i + j) % 5 == 0 and (i, j) not in [(0, 0), (1, 1), (9, 9)]:
+                        self.grid_of_cells[i][j].is_impassable = True
+            self.delivery_tasks = [((1, 1), (9, 9)), ((2, 2), (8, 8))]
+            self.courier_starting_point = (0, 0)
+        elif level_file == "dynamic.map":
+            self.grid_width, self.grid_height = 8, 8
+            self.grid_of_cells = [[GridCell() for _ in range(self.grid_width)] for _ in range(self.grid_height)]
+            # Setting up a small cluster of static obstacles
+            self.grid_of_cells[2][2].is_impassable = True
+            self.grid_of_cells[2][3].is_impassable = True
+            self.grid_of_cells[3][3].is_impassable = True
+            self.delivery_tasks = [((1, 1), (7, 7))]
+            self.courier_starting_point = (0, 0)
+        else:
+            raise ValueError(f"Unknown map file: {level_file}")
+
+# The foundation for all our route-finding algorithms
+class RouteFinderBase:
+    """Abstract base class for pathfinding strategies."""
+    def __init__(self, world: DeliveryWorld):
+        self.world = world
+
+    def get_accessible_neighbors(self, location: Tuple[int, int], current_time: int) -> List[Tuple[Tuple[int, int], float]]:
+        """Identifies valid 4-connected neighbors and their costs."""
+        x, y = location
+        neighboring_locations = []
+        for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.world.grid_height and 0 <= ny < self.world.grid_width:
+                cost = self.world.grid_of_cells[nx][ny].get_movement_difficulty(current_time)
+                if cost < float('inf'):
+                    neighboring_locations.append(((nx, ny), cost))
+        return neighboring_locations
+
+class SimpleRouteFinder(RouteFinderBase):
+    """
+    Implements Breadth-First Search (BFS).
+    Discovers the path with the minimum number of steps.
+    """
+    def find_path(self, start: Tuple[int, int], end: Tuple[int, int]) -> Tuple[Optional[List[Tuple[int, int]]], int]:
+        """Finds a route from a start to an end using BFS."""
+        queue = deque([(start, [start])])
+        visited_nodes = {start}
+        nodes_evaluated = 0
+        while queue:
+            current_pos, path_sequence = queue.popleft()
+            nodes_evaluated += 1
+            if current_pos == end:
+                return path_sequence[1:], nodes_evaluated
+            for neighbor_pos, _ in self.get_accessible_neighbors(current_pos, len(path_sequence)):
+                if neighbor_pos not in visited_nodes:
+                    visited_nodes.add(neighbor_pos)
+                    queue.append((neighbor_pos, path_sequence + [neighbor_pos]))
+        return None, nodes_evaluated
+
+class LeastCostRouteFinder(RouteFinderBase):
+    """
+    Implements Uniform-Cost Search (UCS).
+    Finds the path with the lowest total travel cost.
+    """
+    def find_path(self, start: Tuple[int, int], end: Tuple[int, int]) -> Tuple[Optional[List[Tuple[int, int]]], int]:
+        """Finds a route from a start to an end using UCS."""
+        priority_queue = [(0, start, [start])]
+        path_costs: Dict[Tuple[int, int], float] = {start: 0}
+        nodes_evaluated = 0
+        while priority_queue:
+            cost, current_pos, path_sequence = heapq.heappop(priority_queue)
+            nodes_evaluated += 1
+            if current_pos == end:
+                return path_sequence[1:], nodes_evaluated
+            if cost > path_costs.get(current_pos, float('inf')):
+                continue
+
+            for neighbor_pos, move_cost in self.get_accessible_neighbors(current_pos, len(path_sequence)):
+                new_cost = cost + move_cost
+                if new_cost < path_costs.get(neighbor_pos, float('inf')):
+                    path_costs[neighbor_pos] = new_cost
+                    heapq.heappush(priority_queue, (new_cost, neighbor_pos, path_sequence + [neighbor_pos]))
+        return None, nodes_evaluated
+
+class SmartRouteFinder(RouteFinderBase):
+    """
+    Implements A* Search.
+    Leverages a heuristic (Manhattan distance) to find a cost-optimal path more efficiently.
+    """
+    def calculate_heuristic_distance(self, loc1: Tuple[int, int], loc2: Tuple[int, int]) -> int:
+        """Admissible heuristic: Manhattan distance."""
+        return abs(loc1[0] - loc2[0]) + abs(loc1[1] - loc2[1])
+
+    def find_path(self, start: Tuple[int, int], end: Tuple[int, int]) -> Tuple[Optional[List[Tuple[int, int]]], int]:
+        """Finds a route from a start to an end using A* search."""
+        priority_queue = [(self.calculate_heuristic_distance(start, end), start)]
+        predecessor_map: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        g_scores: Dict[Tuple[int, int], float] = {start: 0}
+        f_scores: Dict[Tuple[int, int], float] = {start: self.calculate_heuristic_distance(start, end)}
+        nodes_evaluated = 0
+
+        while priority_queue:
+            _, current_pos = heapq.heappop(priority_queue)
+            nodes_evaluated += 1
+            if current_pos == end:
+                path = []
+                while current_pos in predecessor_map:
+                    path.append(current_pos)
+                    current_pos = predecessor_map[current_pos]
+                path.append(start)
+                return path[::-1][1:], nodes_evaluated
+
+            for neighbor, cost in self.get_accessible_neighbors(current_pos, int(g_scores.get(current_pos, 0))):
+                tentative_g_score = g_scores.get(current_pos, float('inf')) + cost
+                if tentative_g_score < g_scores.get(neighbor, float('inf')):
+                    predecessor_map[neighbor] = current_pos
+                    g_scores[neighbor] = tentative_g_score
+                    f_scores[neighbor] = tentative_g_score + self.calculate_heuristic_distance(neighbor, end)
+                    heapq.heappush(priority_queue, (f_scores[neighbor], neighbor))
+        return None, nodes_evaluated
+
+class LocalRouteFinder(RouteFinderBase):
+    """
+    Implements a Hill-Climbing with Random Restarts strategy.
+    A local search method that finds a fast, but not necessarily optimal, path.
+    """
+    def __init__(self, world: DeliveryWorld, attempts: int = 5):
+        super().__init__(world)
+        self.attempts = attempts
+
+    def calculate_heuristic_distance(self, loc1: Tuple[int, int], loc2: Tuple[int, int]) -> int:
+        return abs(loc1[0] - loc2[0]) + abs(loc1[1] - loc2[1])
+
+    def compute_path_total_cost(self, path_route: List[Tuple[int, int]]) -> float:
+        total_cost = 0.0
+        for i, pos in enumerate(path_route):
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                raise TypeError(f"Path contains an invalid element: {pos}. Expected a coordinate tuple.")
+            if i > 0:
+                cost = self.world.grid_of_cells[pos[0]][pos[1]].get_movement_difficulty(i)
+                if cost == float('inf'):
+                    return float('inf')
+                total_cost += cost
+        return total_cost
+
+    def find_path(self, start: Tuple[int, int], end: Tuple[int, int]) -> Tuple[Optional[List[Tuple[int, int]]], int]:
+        best_path_found = None
+        lowest_cost = float('inf')
+        nodes_evaluated = 0
+        for _ in range(self.attempts):
+            current_location = start
+            current_path = [start]
+            visited_in_run = {start}
+            while current_location != end:
+                valid_neighbors = [n for n, _ in self.get_accessible_neighbors(current_location, len(current_path)) if n not in visited_in_run]
+                nodes_evaluated += len(valid_neighbors)
+                if not valid_neighbors:
+                    break
+                valid_neighbors.sort(key=lambda n: self.calculate_heuristic_distance(n, end))
+                if random.random() < 0.3:
+                    next_location = random.choice(valid_neighbors)
+                else:
+                    next_location = valid_neighbors[0]
+
+                current_path.append(next_location)
+                visited_in_run.add(next_location)
+                current_location = next_location
+
+            if current_location == end:
+                path_cost = self.compute_path_total_cost(current_path)
+                if path_cost < lowest_cost:
+                    lowest_cost = path_cost
+                    best_path_found = current_path[1:]
+
+        return best_path_found, nodes_evaluated
+
+class CoolingRouteFinder(RouteFinderBase):
+    """
+    Implements a Simulated Annealing strategy.
+    A local search method that can escape local minima by accepting
+    "worse" solutions, especially at the start.
+    """
+    def __init__(self, world: DeliveryWorld, initial_temp: float = 100.0, cooling_rate: float = 0.97):
+        super().__init__(world)
+        self.initial_temp = initial_temp
+        self.cooling_rate = cooling_rate
+
+    def generate_a_random_path(self, start: Tuple[int, int], end: Tuple[int, int], max_length: int = 50) -> List[Tuple[int, int]]:
+        path = [start]
+        current_location = start
+        for _ in range(max_length):
+            if current_location == end:
+                break
+            neighbors = self.get_accessible_neighbors(current_location, len(path))
+            if not neighbors:
+                break
+            next_location = random.choice(neighbors)[0]
+            path.append(next_location)
+            current_location = next_location
+        return path
+
+    def modify_path(self, path: List[Tuple[int, int]], end: Tuple[int, int]) -> List[Tuple[int, int]]:
+        new_path = path[:]
+        if len(new_path) > 2 and random.random() < 0.5:
+            # Randomly alter a point in the path
+            idx = random.randint(1, len(new_path) - 2)
+            neighbors = self.get_accessible_neighbors(new_path[idx - 1], idx)
+            if neighbors:
+                new_path[idx] = random.choice(neighbors)[0]
+        else:
+            # Try to extend the path
+            if new_path[-1] != end:
+                neighbors = self.get_accessible_neighbors(new_path[-1], len(new_path))
+                if neighbors:
+                    new_path.append(random.choice(neighbors)[0])
+        return new_path
+
+    def compute_path_total_cost(self, path_route: List[Tuple[int, int]]) -> float:
+        total_cost = 0.0
+        for i, pos in enumerate(path_route):
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                raise TypeError(f"Path contains an invalid element: {pos}. Expected a coordinate tuple.")
+            if i > 0:
+                cost = self.world.grid_of_cells[pos[0]][pos[1]].get_movement_difficulty(i)
+                if cost == float('inf'):
+                    return float('inf')
+                total_cost += cost
+        return total_cost
+
+    def find_path(self, start: Tuple[int, int], end: Tuple[int, int]) -> Tuple[Optional[List[Tuple[int, int]]], int]:
+        current_path = self.generate_a_random_path(start, end)
+        if not current_path or current_path[-1] != end:
+            return None, 0
+        current_cost = self.compute_path_total_cost(current_path)
+        temperature = self.initial_temp
+        nodes_evaluated = 0
+
+        while temperature > 1 and current_path and current_path[-1] == end:
+            new_path = self.modify_path(current_path, end)
+            nodes_evaluated += 1
+            new_cost = self.compute_path_total_cost(new_path)
+
+            if new_cost < current_cost or random.random() < math.exp((current_cost - new_cost) / temperature):
+                current_path = new_path
+                current_cost = new_cost
+            temperature *= self.cooling_rate
+
+        if current_path and current_path[-1] == end:
+            return current_path[1:], nodes_evaluated
+        else:
+            return None, nodes_evaluated
+
+# The main character of our story: the delivery courier
+class AutomatedCourier:
+    """The autonomous agent that navigates the world and delivers packages."""
+    def __init__(self, world_map: DeliveryWorld, strategy_type: str = 'astar', gui_update_func: Optional[callable] = None):
+        self.world = world_map
+        self.current_location = world_map.courier_starting_point
+        self.packages_to_process = world_map.delivery_tasks[:]
+        self.completed_deliveries: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        self.energy_remaining = world_map.energy_capacity
+        self.elapsed_time = 0
+        self.strategy_type = strategy_type
+        self.my_planner = self.select_planning_strategy(strategy_type)
+        self.history_log: List[str] = []
+        self.gui_update_func = gui_update_func
+
+    def select_planning_strategy(self, strategy_type: str) -> Any:
+        """Chooses the correct route-finding strategy based on user input."""
+        if strategy_type == 'bfs':
+            return SimpleRouteFinder(self.world)
+        elif strategy_type == 'ucs':
+            return LeastCostRouteFinder(self.world)
+        elif strategy_type == 'astar':
+            return SmartRouteFinder(self.world)
+        elif strategy_type == 'hillclimb':
+            return LocalRouteFinder(self.world)
+        elif strategy_type == 'simanneal':
+            return CoolingRouteFinder(self.world)
+        else:
+            raise ValueError(f"The '{strategy_type}' strategy is not recognized.")
+
+    def calculate_route(self, origin: Tuple[int, int], final_dest: Tuple[int, int]) -> Tuple[Optional[List[Tuple[int, int]]], int]:
+        """Plans a path from an origin to a final destination."""
+        return self.my_planner.find_path(origin, final_dest)
+
+    def execute_delivery_run(self) -> bool:
+        """Commences the delivery process for all assigned packages."""
+        self.history_log.append(f"Starting the delivery run with the {self.strategy_type} strategy!")
+        self.history_log.append(f"Current location: {self.current_location}, with {self.energy_remaining} energy left.")
+
+        while self.packages_to_process and self.energy_remaining > 0 and self.elapsed_time < self.world.time_allowance:
+            package_pickup_loc, delivery_loc = self.packages_to_process[0]
+            self.history_log.append(f"Finding a way to the package at {package_pickup_loc}")
+            path_to_package, nodes_evaluated = self.calculate_route(self.current_location, package_pickup_loc)
+            self.history_log.append(f"The planner evaluated {nodes_evaluated} nodes to find the path.")
+
+            if not path_to_package:
+                self.history_log.append("Unable to find a path to the package.")
+                return False
+
+            if not self.traverse_the_route(path_to_package, package_pickup_loc):
+                return False
+
+            self.history_log.append(f"Package successfully collected at {package_pickup_loc}!")
+            self.packages_to_process.pop(0)
+
+            self.history_log.append(f"Now navigating to the drop-off point at {delivery_loc}.")
+            path_to_dest, nodes_evaluated = self.calculate_route(self.current_location, delivery_loc)
+            self.history_log.append(f"The destination route required evaluating {nodes_evaluated} nodes.")
+
+            if not path_to_dest:
+                self.history_log.append("The path to the destination is blocked!")
+                return False
+
+            if not self.traverse_the_route(path_to_dest, delivery_loc):
+                return False
+
+            self.history_log.append(f"Package delivered to {delivery_loc}!")
+            self.completed_deliveries.append((package_pickup_loc, delivery_loc))
+
+        run_successful = not self.packages_to_process
+        self.history_log.append(f"The delivery run is complete! Success status: {run_successful}")
+        self.history_log.append(f"Total packages delivered: {len(self.completed_deliveries)}")
+        self.history_log.append(f"Remaining energy: {self.energy_remaining}")
+        self.history_log.append(f"Total time elapsed: {self.elapsed_time}")
+        return run_successful
+
+    def traverse_the_route(self, route: List[Tuple[int, int]], final_destination: Tuple[int, int]) -> bool:
+        """
+        Moves the courier along a planned path. Handles dynamic obstacles and re-planning.
+        """
+        if not route:
+            return False
+
+        for next_location in route:
+            if self.energy_remaining <= 0 or self.elapsed_time >= self.world.time_allowance:
+                self.history_log.append("Ran out of energy or time! Delivery aborted.")
+                return False
+
+            cell_cost = self.world.grid_of_cells[next_location[0]][next_location[1]].get_movement_difficulty(self.elapsed_time)
+
+            if cell_cost == float('inf'):
+                self.history_log.append(f"Encountered an unexpected obstacle at {next_location}. Re-planning route!")
+                new_route, nodes_evaluated = self.calculate_route(self.current_location, final_destination)
+                self.history_log.append(f"New route search evaluated {nodes_evaluated} nodes.")
+
+                if not new_route:
+                    self.history_log.append("Could not find an alternative route. Aborting mission!")
+                    return False
+
+                return self.traverse_the_route(new_route, final_destination)
+
+            self.energy_remaining -= cell_cost
+            self.elapsed_time += 1
+            self.current_location = next_location
+
+            if self.gui_update_func:
+                self.gui_update_func(self)
+                time.sleep(0.3)
+
+            if self.elapsed_time % 5 == 0:
+                self.history_log.append(f"Time {self.elapsed_time}: At {next_location}, with {self.energy_remaining} energy.")
+
+        return True
+
+# The user-friendly interface
+class DeliveryInterface:
+    """The Tkinter GUI for the simulation."""
+    def __init__(self, main_window: tk.Tk):
+        self.main_window = main_window
+        self.main_window.title("Automated Courier - Control Panel")
+        self.main_window.geometry("1000x700")
+        self.simulation_world: Optional[DeliveryWorld] = None
+        self.courier_agent: Optional[AutomatedCourier] = None
+        self.is_running = False
+        self.total_packages = 0
+        self.setup_ui_components()
+
+    def setup_ui_components(self):
+        """Builds the graphical user interface layout."""
+        main_container = ttk.Frame(self.main_window, padding="10")
+        main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        control_group = ttk.LabelFrame(main_container, text="Settings", padding="5")
+        control_group.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Label(control_group, text="Select Map:").grid(row=0, column=0, sticky=tk.W)
+        self.map_choice = tk.StringVar(value="small.map")
+        map_dropdown = ttk.Combobox(control_group, textvariable=self.map_choice,
+                                    values=["small.map", "medium.map", "large.map", "dynamic.map"],
+                                    width=15)
+        map_dropdown.grid(row=0, column=1, padx=5)
+
+        ttk.Label(control_group, text="Choose Strategy:").grid(row=0, column=2, sticky=tk.W, padx=(20, 0))
+        self.strategy_choice = tk.StringVar(value="astar")
+        strategy_dropdown = ttk.Combobox(control_group, textvariable=self.strategy_choice,
+                                         values=["bfs", "ucs", "astar", "hillclimb", "simanneal"], width=15)
+        strategy_dropdown.grid(row=0, column=3, padx=5)
+
+        ttk.Button(control_group, text="Start Simulation", command=self.begin_simulation).grid(row=0, column=4, padx=10)
+        ttk.Button(control_group, text="Run Comparative Test", command=self.run_comparison_test).grid(row=0, column=5, padx=10)
+        ttk.Button(control_group, text="Reset", command=self.reset_interface).grid(row=0, column=6, padx=10)
+
+        display_group = ttk.LabelFrame(main_container, text="Grid View", padding="5")
+        display_group.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.grid_canvas = tk.Canvas(display_group, width=600, height=600, bg="white")
+        self.grid_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        log_group = ttk.LabelFrame(main_container, text="Log & Status", padding="5")
+        log_group.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        self.log_text_box = tk.Text(log_group, width=40, height=35)
+        self.log_text_box.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        log_scrollbar = ttk.Scrollbar(log_group, orient=tk.VERTICAL, command=self.log_text_box.yview)
+        log_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.log_text_box.configure(yscrollcommand=log_scrollbar.set)
+
+        self.main_window.columnconfigure(0, weight=1)
+        self.main_window.rowconfigure(0, weight=1)
+        main_container.columnconfigure(0, weight=1)
+        main_container.columnconfigure(1, weight=0)
+        main_container.rowconfigure(1, weight=1)
+        display_group.columnconfigure(0, weight=1)
+        display_group.rowconfigure(0, weight=1)
+        log_group.columnconfigure(0, weight=1)
+        log_group.rowconfigure(0, weight=1)
+
+    def refresh_screen(self, agent: 'AutomatedCourier'):
+        """Updates the GUI with the courier's current state."""
+        self.log_text_box.delete(1.0, tk.END)
+        for log_entry in agent.history_log[-20:]:
+            self.log_text_box.insert(tk.END, log_entry + "\n")
+        self.log_text_box.see(tk.END)
+        self.render_grid(agent)
+        self.main_window.update_idletasks()
+        self.main_window.update()
+
+    def render_grid(self, agent: 'AutomatedCourier'):
+        """Draws the grid, agent, packages, and obstacles on the canvas."""
+        self.grid_canvas.delete("all")
+        if not self.simulation_world:
+            return
+
+        cell_size = min(600 // self.simulation_world.grid_width, 600 // self.simulation_world.grid_height)
+        for i in range(self.simulation_world.grid_height):
+            for j in range(self.simulation_world.grid_width):
+                x1, y1 = j * cell_size, i * cell_size
+                x2, y2 = x1 + cell_size, y1 + cell_size
+                
+                if self.simulation_world.grid_of_cells[i][j].is_impassable:
+                    color = "black"
+                elif self.simulation_world.grid_of_cells[i][j].traversability_cost > 1:
+                    color = "lightgreen"
+                else:
+                    color = "white"
+                
+                self.grid_canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="gray")
+                
+                if self.simulation_world.grid_of_cells[i][j].traversability_cost > 1:
+                    self.grid_canvas.create_text(x1 + cell_size//2, y1 + cell_size//2,
+                                                text=str(self.simulation_world.grid_of_cells[i][j].traversability_cost))
+
+        for package_pos, destination in self.simulation_world.delivery_tasks + agent.completed_deliveries:
+            x, y = package_pos[1] * cell_size + cell_size//2, package_pos[0] * cell_size + cell_size//2
+            self.grid_canvas.create_oval(x-5, y-5, x+5, y+5, fill="blue", outline="blue")
+            
+            dx, dy = destination[1] * cell_size + cell_size//2, destination[0] * cell_size + cell_size//2
+            self.grid_canvas.create_rectangle(dx-5, dy-5, dx+5, dy+5, fill="red", outline="red")
+
+        ax, ay = agent.current_location[1] * cell_size + cell_size//2, agent.current_location[0] * cell_size + cell_size//2
+        self.grid_canvas.create_oval(ax-8, ay-8, ax+8, ay+8, fill="yellow", outline="black")
+
+        stats_text = f"Energy: {agent.energy_remaining} | Time: {agent.elapsed_time} | Packages: {len(agent.completed_deliveries)}/{self.total_packages}"
+        self.grid_canvas.create_text(300, 10, text=stats_text, anchor=tk.N, fill="black")
+
+    def begin_simulation(self):
+        """Starts the simulation loop in a separate thread."""
+        if self.is_running:
+            return
+            
+        self.is_running = True
+        self.log_text_box.delete(1.0, tk.END)
+        
+        self.simulation_world = DeliveryWorld()
+        self.simulation_world.configure_environment(self.map_choice.get())
+        
+        if self.map_choice.get() == "dynamic.map":
+            def dynamic_event():
+                if self.courier_agent and self.courier_agent.elapsed_time >= 20:
+                    self.simulation_world.grid_of_cells[4][4].is_impassable = True
+                    if self.courier_agent.gui_update_func:
+                        self.courier_agent.gui_update_func(self.courier_agent)
+            
+            self.simulation_world.grid_of_cells[4][4].is_impassable = False
+            self.main_window.after(100, dynamic_event)
+        
+        self.total_packages = len(self.simulation_world.delivery_tasks)
+        self.courier_agent = AutomatedCourier(self.simulation_world, self.strategy_choice.get(), self.refresh_screen)
+
+        def run_agent_in_thread():
+            try:
+                start_time_perf = time.perf_counter()
+                success_status = self.courier_agent.execute_delivery_run()
+                end_time_perf = time.perf_counter()
+                
+                result_summary = f"\nSelected Strategy: {self.strategy_choice.get()}\n"
+                result_summary += f"Was the run successful? {success_status}\n"
+                result_summary += f"Packages delivered: {len(self.courier_agent.completed_deliveries)}\n"
+                result_summary += f"Energy remaining: {self.courier_agent.energy_remaining}\n"
+                result_summary += f"Time elapsed: {self.courier_agent.elapsed_time}\n"
+                result_summary += f"Total computation time: {end_time_perf - start_time_perf:.6f} seconds\n"
+                
+                self.log_text_box.insert(tk.END, result_summary)
+                self.log_text_box.see(tk.END)
+            except Exception as e:
+                self.log_text_box.insert(tk.END, f"\nAn exception occurred: {e}\n")
+                messagebox.showerror("Error", f"An exception occurred: {e}")
+            finally:
+                self.is_running = False
+            
+        thread_sim = threading.Thread(target=run_agent_in_thread)
+        thread_sim.daemon = True
+        thread_sim.start()
+
+    def run_comparison_test(self):
+        """Runs and compares all algorithms on all static maps."""
+        if self.is_running:
+            return
+            
+        self.is_running = True
+        self.log_text_box.delete(1.0, tk.END)
+        self.log_text_box.insert(tk.END, "Comparing all available strategies...\n")
+        
+        map_files_to_test = ["small.map", "medium.map", "large.map"]
+        strategies_to_compare = ['bfs', 'ucs', 'astar', 'hillclimb', 'simanneal']
+        test_results = []
+
+        def execute_comparison():
+            try:
+                for map_file in map_files_to_test:
+                    for strategy in strategies_to_compare:
+                        self.log_text_box.insert(tk.END, f"\nTesting '{strategy}' on '{map_file}'...\n")
+                        self.log_text_box.see(tk.END)
+                        
+                        world = DeliveryWorld()
+                        world.configure_environment(map_file)
+                        
+                        start_time_perf = time.perf_counter()
+                        agent = AutomatedCourier(world, strategy)
+                        success_status = agent.execute_delivery_run()
+                        end_time_perf = time.perf_counter()
+                        
+                        test_results.append({
+                            'map_name': map_file,
+                            'strategy_name': strategy,
+                            'status': success_status,
+                            'delivered_count': len(agent.completed_deliveries),
+                            'energy_left': agent.energy_remaining,
+                            'time_taken': agent.elapsed_time,
+                            'processing_time': end_time_perf - start_time_perf
+                        })
+
+                self.log_text_box.insert(tk.END, "\n" + "="*80 + "\n")
+                self.log_text_box.insert(tk.END, "COMPARATIVE RESULTS SUMMARY:\n")
+                self.log_text_box.insert(tk.END, "="*80 + "\n")
+                
+                header = f"{'Map':<15}{'Strategy':<15}{'Success':<10}{'Delivered':<12}{'Energy':<10}{'Time':<10}{'Proc. Time':<15}\n"
+                self.log_text_box.insert(tk.END, header)
+                
+                for res in test_results:
+                    result_line = f"{res['map_name']:<15}{res['strategy_name']:<15}{str(res['status']):<10}{res['delivered_count']:<12}{res['energy_left']:<10}{res['time_taken']:<10}{res['processing_time']:.6f}\n"
+                    self.log_text_box.insert(tk.END, result_line)
+                    
+                self.log_text_box.see(tk.END)
+            except Exception as e:
+                self.log_text_box.insert(tk.END, f"\nAn error occurred during comparison: {e}\n")
+                messagebox.showerror("Error", f"An error occurred during comparison: {e}")
+            finally:
+                self.is_running = False
+
+        thread_comparison = threading.Thread(target=execute_comparison)
+        thread_comparison.daemon = True
+        thread_comparison.start()
+
+    def reset_interface(self):
+        """Resets the simulation and GUI to their initial state."""
+        if self.is_running:
+            self.log_text_box.insert(tk.END, "\nCannot reset while a simulation is in progress.\n")
+            return
+            
+        self.simulation_world = None
+        self.courier_agent = None
+        self.grid_canvas.delete("all")
+        self.log_text_box.delete(1.0, tk.END)
+        messagebox.showinfo("Reset", "The simulation environment has been reset.")
+
+def launch_application():
+    """Initializes and starts the GUI application."""
+    root_window = tk.Tk()
+    app = DeliveryInterface(root_window)
+    root_window.mainloop()
+
+if __name__ == '__main__':
+    launch_application()
+
